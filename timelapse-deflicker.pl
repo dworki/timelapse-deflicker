@@ -76,7 +76,7 @@ $Passes        = $opt{'p'} if defined( $opt{'p'} );
 
 #This integer test fails on "+n", but that isn't serious here.
 die "The rolling average window for luminance smoothing should be a positive number greater or equal to 2" if ! ($RollingWindow eq int( $RollingWindow ) && $RollingWindow > 1 ) ;
-die "The number of passes should be a positive number greater or equal to 1"                               if ! ($Passes eq int( $Passes ) && $Passes > 0 ) ;
+die "The number of passes should be a positive number greater or equal to 0"                               if ! ($Passes eq int( $Passes ) && $Passes >= 0 ) ;
 
 # Create hash to hold luminance values.
 # Format will be: TODO: Add this here
@@ -134,7 +134,7 @@ while ( $CurrentPass <= $Passes ) {
 }
 
 say "\n\n-------------- CHANGING OF BRIGHTNESS WITH THE CALCULATED VALUES --------------\n";
-luminance_change();
+if ($Passes){ luminance_change()} # Set passes equal to 0 to skip smoothing; only measure luminance for later.
 
 say "\n\nJob completed";
 say "$max_entries files have been processed";
