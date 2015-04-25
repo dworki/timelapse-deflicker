@@ -127,11 +127,11 @@ luminance_det();
 
 my $CurrentPass = 1;
 
-while ( $CurrentPass <= $Passes ) {
+do {
   say "\n-------------- LUMINANCE SMOOTHING PASS $CurrentPass/$Passes --------------\n";
   luminance_calculation();
   $CurrentPass++;
-}
+} while ( $CurrentPass <= $Passes );
 
 say "\n\n-------------- CHANGING OF BRIGHTNESS WITH THE CALCULATED VALUES --------------\n";
 if ($Passes){ luminance_change()} # Set passes equal to 0 to skip smoothing; only measure luminance for later.
@@ -213,6 +213,8 @@ sub luminance_calculation {
       }
     }
     $luminance{$i}{value} = $avg_lumi / $sample_avg_count;
+    debug("Original luminance of $luminance{$i}{filename}: $luminance{$i}{original}\n");
+    debug("Smoothed luminance of $luminance{$i}{filename}: $luminance{$i}{value}\n");
 
     $progress->update( $i + 1 );
   }
@@ -222,8 +224,6 @@ sub luminance_change {
   my $progress = Term::ProgressBar->new( { count => $max_entries } );
 
   for ( my $i = 0; $i < $max_entries; $i++ ) {
-    debug("Original luminance of $luminance{$i}{filename}: $luminance{$i}{original}\n");
-    debug("Changed luminance of $luminance{$i}{filename}: $luminance{$i}{value}\n");
  
     #ImageMagick wants a brightness change as a percentage:
     my $brightness = ( $luminance{$i}{value} / $luminance{$i}{original} ) * 100;
