@@ -180,6 +180,7 @@ sub luminance_det {
       # We use the following formula to get the perceived luminance.
       # Set it as the original and target value to start out with.
       $luminance{$i}{value} = $luminance{$i}{original} = 0.299 * $R + 0.587 * $G + 0.114 * $B;
+      debug("Calculated luminance $luminance{$i}{original} from $luminance{$i}{filename}\n");
 
       #Write luminance info to an xmp file.
       #This is the xmp for the input file, so it contains the original luminance.
@@ -223,8 +224,9 @@ sub luminance_change {
   for ( my $i = 0; $i < $max_entries; $i++ ) {
     debug("Original luminance of $luminance{$i}{filename}: $luminance{$i}{original}\n");
     debug("Changed luminance of $luminance{$i}{filename}: $luminance{$i}{value}\n");
-
-    my $brightness = ( 1 / ( $luminance{$i}{original} / $luminance{$i}{value} ) ) * 100;
+ 
+    #ImageMagick wants a brightness change as a percentage:
+    my $brightness = ( $luminance{$i}{value} / $luminance{$i}{original} ) * 100;
 
     debug("Imagemagick will set brightness of $luminance{$i}{filename} to: $brightness\n");
 
