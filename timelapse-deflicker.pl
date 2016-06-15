@@ -17,6 +17,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 # Needed packages
+use strict;
 use Getopt::Std;
 use strict "vars";
 use feature "say";
@@ -35,29 +36,9 @@ my $startTime = [gettimeofday];
 # Global variables
 my $VERBOSE       = 0;
 my $DEBUG         = 0;
-my $RollingWindow = 15;
-my $Passes        = 1;
-my $Processes     = 2;
-
-#Define namespace and tag for luminance, to be used in the XMP files.
-%Image::ExifTool::UserDefined::luminance = (
-	GROUPS    => { 0           => 'XMP', 1                              => 'XMP-luminance', 2 => 'Image' },
-	NAMESPACE => { 'luminance' => 'https://github.com/cyberang3l/timelapse-deflicker' }, #Sort of semi stable reference?
-	WRITABLE  => 'string',
-	luminance => {}
-);
-
-%Image::ExifTool::UserDefined = (
-
-	# new XMP namespaces (ie. XMP-xxx) must be added to the Main XMP table:
-	'Image::ExifTool::XMP::Main' => {
-		luminance => {
-			SubDirectory => {
-				TagTable => 'Image::ExifTool::UserDefined::luminance'
-			},
-		},
-	}
-);
+my $rollingWindow = 15;
+my $passes        = 1;
+my $processes     = 2;
 
 #####################
 # handle flags and arguments
@@ -78,152 +59,171 @@ if ( $opt{'h'} ) {
 
 $VERBOSE       = 1         if $opt{'v'};
 $DEBUG         = 1         if $opt{'d'};
-$RollingWindow = $opt{'w'} if defined( $opt{'w'} );
-$Passes        = $opt{'p'} if defined( $opt{'p'} );
-$Processes     = $opt{'t'} if defined( $opt{'t'} );
+$rollingWindow = $opt{'w'} if defined( $opt{'w'} );
+$passes        = $opt{'p'} if defined( $opt{'p'} );
+$processes     = $opt{'t'} if defined( $opt{'t'} );
 
 #This integer test fails on "+n", but that isn't serious here.
 die "The rolling average window for luminance smoothing should be a positive number greater or equal to 2"
-  if !( $RollingWindow eq int($RollingWindow) && $RollingWindow > 1 );
-die "The number of passes should be a positive number greater or equal to 1"  if !( $Passes eq int($Passes)       && $Passes > 0 );
-die "The number of threads should be a positive number greater or equal to 1" if !( $Processes eq int($Processes) && $Processes > 0 );
+  if !( $rollingWindow eq int($rollingWindow) && $rollingWindow > 1 );
+die "The number of passes should be a positive number greater or equal to 1"  if !( $passes eq int($passes)       && $passes > 0 );
+die "The number of threads should be a positive number greater or equal to 1" if !( $processes eq int($processes) && $processes > 0 );
 
-# Create hash to hold luminance values.
-# Format will be: TODO: Add this here
-my $luminance = [];
+# load all image files from current directory
+my @files = findFilesToProcess(".");
+my $count = scalar @files;
 
-# The working directory is the current directory.
-my $data_dir = ".";
-opendir( DATA_DIR, $data_dir ) || die "Cannot open $data_dir\n";
+if ( $count < 2 ) { die "Cannot process less than two files.\n" }
 
-#Put list of files in the directory into an array:
-my @files;
-my $prevfmt = "";
+say "Found $count image files to be processed.";
+say "\n------------ CALCULATING ORIGINAL IMAGE LUMINANCE ------------------------------\n";
 
-# create a clean list of image files (no '.',  '..' and other garbage)
-while ( my $file = readdir(DATA_DIR) ) {
-	my $ft   = File::Type->new();
-	my $type = $ft->mime_type($file);
-	my ( $filetype, $fileformat ) = split( /\//, $type );
-	next unless ( $filetype eq "image" );
-	if ( $prevfmt eq "" ) { $prevfmt = $fileformat }
-	elsif ( $prevfmt ne "warned" && $prevfmt ne $fileformat ) {
-		say "Images of type $prevfmt and $fileformat detected! ARE YOU SURE THIS IS JUST ONE IMAGE SEQUENCE?";
+# Determine luminance of each file and add to an array
+# format of each value in $luminance array: {id=>array_index, filename=>name, original=>original_luminance, value=>modified_luminance}
+my $luminance = computeLuminance(@files);
 
-		# no more warnings about this from now on
-		$prevfmt = "warned";
-	}
-	push @files, $file;
+for ( my $pass = 1 ; $pass <= $passes ; $pass++ ) {
+	say "\n\n------------ LUMINANCE SMOOTHING PASS $pass/$passes --------------------------------------\n";
+	calculateNewLuminance($luminance);
 }
 
-#Assume that the files are named in dictionary sequence - they will be processed as such.
-@files = sort @files;
-
-#Initialize count variable to number files in hash
-my $count = 0;
-
-#Initialize a variable to hold the previous image type detected - if this changes, warn user
-my $prevfmt = "";
-
-if ( @files < 2 ) { die "Cannot process less than two files.\n" }
-
-say "Found ".@files." image files to be processed.";
-say "Original luminance of Images is being calculated";
-
-#Determine luminance of each file and add to the hash.
-luminance_det();
-
-my $CurrentPass = 1;
-
-while ( $CurrentPass <= $Passes ) {
-	say "\n-------------- LUMINANCE SMOOTHING PASS $CurrentPass/$Passes --------------\n";
-	new_luminance_calculation();
-	$CurrentPass++;
-}
-
-say "\n\n-------------- CHANGING OF BRIGHTNESS WITH THE CALCULATED VALUES --------------\n";
-luminance_change();
+say "\n\n------------ CHANGING IMAGE BRIGHTNESS WITH THE CALCULATED VALUES --------------\n";
+modifyLuminance($luminance);
 
 say "\n\nJob completed in " . sprintf( "%1.0f seconds.", tv_interval($startTime) );
-say @$luminance." files have been processed";
+say "$count files have been processed.";
+exit 0;
 
 #####################
 # Helper routines
 
-#Determine luminance of each image; add to hash.
-sub luminance_det {
-	my $pm = Parallel::ForkManager->new( $Processes, '/tmp/' );
+# create sorted list of all image files in given directory
+sub findFilesToProcess() {
+	my ($dir) = @_;
+	opendir( DATA_DIR, $dir ) || die "Cannot open $dir\n";
 
-	# data structure retrieval and handling
+	# create a clean list of image files
+	my $ft      = File::Type->new();
+	my $prevfmt = "";
+	while ( my $file = readdir(DATA_DIR) ) {
+		my $type = $ft->mime_type($file);
+		my ( $filetype, $fileformat ) = split( /\//, $type );
+		next unless ( $filetype eq "image" );
+		if ( $prevfmt eq "" ) { $prevfmt = $fileformat }
+		elsif ( $prevfmt ne "warned" && $prevfmt ne $fileformat ) {
+			say "Images of type $prevfmt and $fileformat detected! ARE YOU SURE THIS IS JUST ONE IMAGE SEQUENCE?";
+
+			# no more warnings about this from now on
+			$prevfmt = "warned";
+		}
+		push @files, $file;
+	}
+	closedir(DATA_DIR);
+
+	# assume that the files are named in dictionary sequence - they will be processed as such.
+	return sort @files;
+}
+
+sub initializeImageExifTool {
+
+	#Define namespace and tag for luminance, to be used in the XMP files.
+	%Image::ExifTool::UserDefined::luminance = (
+		GROUPS    => { 0           => 'XMP', 1                              => 'XMP-luminance', 2 => 'Image' },
+		NAMESPACE => { 'luminance' => 'https://github.com/cyberang3l/timelapse-deflicker' }, #Sort of semi stable reference?
+		WRITABLE  => 'string',
+		luminance => {}
+	);
+
+	%Image::ExifTool::UserDefined = (
+
+		# new XMP namespaces (ie. XMP-xxx) must be added to the Main XMP table:
+		'Image::ExifTool::XMP::Main' => {
+			luminance => {
+				SubDirectory => {
+					TagTable => 'Image::ExifTool::UserDefined::luminance'
+				},
+			},
+		}
+	);
+}
+
+# Determine luminance of each image file in given array and return them all as an array of hashes
+# format of each value in resulting array: {id=>array_index, filename=>name, original=>original_luminance, value=>original_luminance}
+sub computeLuminance {
+	initializeImageExifTool();
+	my $pm = Parallel::ForkManager->new( $processes, '/tmp/' );
+	my $luminance = [];
+
+	# Parallel::ForkManager result retrieval
+	# the sub is called with data returned from each child process
 	$pm->run_on_finish(
 		sub {
+			# $data holds a list of luminance hashes with calculated values
 			my ( $pid, $exit_code, $ident, $exit_signal, $core_dump, $data ) = @_;
+			die "No message received from child process $pid!\n" unless defined($data);
 
-			# retrieve data structure from child
-			if ( defined($data) ) {
-				foreach my $lum (@$data) {
-					$luminance->[ $lum->{id} ] = $lum;
-				}
-			} else {
-				die "No message received from child process $pid!\n";
+			# put calculated values back to original positions in $luminance array
+			foreach my $lum (@$data) {
+				$luminance->[ $lum->{id} ] = $lum;
 			}
 		}
 	);
 
+	# split work into multiple queues for parallel processing
 	my $queues = [];
-
-	for ( my $i = 0 ; $i < @files ; $i++ ) {
-		my $lum = { id => $i, filename => $files[$i] };
-		my $qId = $i % $Processes;
-		unless ( defined $queues->[$qId] ) {
-			$queues->[$qId] = [];
-		}
+	for ( my $i = 0 ; $i < @_ ; $i++ ) {
+		my $lum = { id => $i, filename => $_[$i] };
+		my $qId = $i % $processes;
+		$queues->[$qId] = [] unless defined $queues->[$qId];
 		push( @{ $queues->[$qId] }, $lum );
 	}
 
-	my $qId = 0;
-	foreach my $q (@$queues) {
-		$qId++;
+	# process queues in parallel
+	for ( my $qId = 0 ; $qId < @$queues ; $qId++ ) {
+
+		# start new child for each queue
 		$pm->start and next;
-		my $progress;
-		if ( $qId == 1 ) {
-			$progress = Term::ProgressBar->new( { count => scalar @$q } );
-		}
+		my $q = $queues->[$qId];
+		my $progressBar = Term::ProgressBar->new( { count => scalar @$q } ) if ( $qId == 0 );
 		verbose( "this child got " . @$q . " images\n" );
 		my $i = 0;
 		foreach my $lum (@$q) {
 			computeOriginalLuminance($lum);
-			if ( $qId == 1 ) {
-				$progress->update( ++$i );
-			}
+			$progressBar->update( ++$i ) if ( $qId == 0 );
 		}
+
+		# finish the child and return calculated values
 		$pm->finish( 0, $q );
 	}
 	$pm->wait_all_children;
+	return $luminance;
 }
 
+# computes original luminance of given file
 sub computeOriginalLuminance {
 	my ($lum) = @_;
 
-	#Create exifTool object for the image
+	# Create exifTool object for the image
 	my $exifTool = new Image::ExifTool;
-	my $exifinfo;                 #variable to hold info read from xmp file if present.
+	my $exifinfo;    # variable to hold info read from xmp file if present.
+	my $file    = $lum->{filename};
+	my $xmpFile = $lum->{filename} . ".xmp";
 
 	#If there's already an xmp file for this filename, read it.
-	if ( -e $lum->{filename} . ".xmp" ) {
-		$exifinfo = $exifTool->ImageInfo( $lum->{filename} . ".xmp" );
-		debug( "Found xmp file: " . $lum->{filename} . ".xmp\n" );
+	if ( -e $xmpFile ) {
+		$exifinfo = $exifTool->ImageInfo($xmpFile);
+		debug("Found xmp file: $xmpFile\n");
 	}
 
-	#Now, if it already has a luminance value, just use that:
+	# Now, if it already has a luminance value, just use that:
 	if ( length $$exifinfo{Luminance} ) {
 
 		# Set it as the original and target value to start out with.
 		$lum->{value} = $lum->{original} = $$exifinfo{Luminance};
-		debug( "Read luminance $$exifinfo{Luminance} from xmp file: " . $lum->{filename} . ".xmp\n" );
+		debug("Read luminance $$exifinfo{Luminance} from xmp file: $xmpFile\n");
 	} else {
 		my $image = Image::Magick->new;
-		$image->Read( $lum->{filename} );
+		$image->Read($file);
 		my @statistics = $image->Statistics();
 
 		# Use the command "identify -verbose <some image file>" in order to see why $R, $G and $B
@@ -242,22 +242,24 @@ sub computeOriginalLuminance {
 		$exifTool->SetNewValue( luminance => $lum->{original} );
 
 		#If there is already an xmp file, just update it:
-		if ( -e $lum->{filename} . ".xmp" ) {
-			$exifTool->WriteInfo( $lum->{filename} . ".xmp" );
+		if ( -e $xmpFile ) {
+			$exifTool->WriteInfo($xmpFile);
+		} else {
 
 			#Otherwise, create a new one:
-		} else {
-			$exifTool->WriteInfo( undef, $lum->{filename} . ".xmp", 'XMP' );    #Write the XMP file
+			$exifTool->WriteInfo( undef, $xmpFile, 'XMP' );    # Write the XMP file
 		}
 
 	}
 }
 
-sub new_luminance_calculation {
+# calculates new luminance values for all images
+sub calculateNewLuminance {
+	my ($luminance) = @_;
 	my $count = @$luminance;
-	my $progress    = Term::ProgressBar->new( { count => scalar $count} );
-	my $low_window  = int( $RollingWindow / 2 );
-	my $high_window = $RollingWindow - $low_window;
+	my $progressBar = Term::ProgressBar->new( { count => $count } );
+	my $low_window  = int( $rollingWindow / 2 );
+	my $high_window = $rollingWindow - $low_window;
 
 	for ( my $i = 0 ; $i < $count ; $i++ ) {
 		my $sample_avg_count = 0;
@@ -269,43 +271,40 @@ sub new_luminance_calculation {
 			}
 		}
 		$luminance->[$i]->{value} = $avg_lumi / $sample_avg_count;
-
-		$progress->update( $i + 1 );
+		$progressBar->update( $i + 1 );
 	}
 }
 
-sub luminance_change {
+# modifies luminance of all files based on calculated values
+sub modifyLuminance {
+	my ($luminance) = @_;
 
+	# ensure output directory exists
 	if ( !-d "Deflickered" ) {
 		mkdir("Deflickered") || die "Error creating directory: $!\n";
 	}
 
+	# split work into multiple queues for parallel processing
 	my $queues = [];
-
 	for ( my $i = 0 ; $i < @$luminance ; $i++ ) {
 		my $lum = $luminance->[$i];
-		my $qId = $i % $Processes;
-		unless ( defined $queues->[$qId] ) {
-			$queues->[$qId] = [];
-		}
+		my $qId = $i % $processes;
+		$queues->[$qId] = [] unless ( defined $queues->[$qId] );
 		push( @{ $queues->[$qId] }, $lum );
 	}
 
-	my $pm = Parallel::ForkManager->new( $Processes, '/tmp/' );
-	my $qId = 0;
-	my $progress;
-	foreach my $q (@$queues) {
-		$qId++;
+	my $pm = Parallel::ForkManager->new( $processes, '/tmp/' );
+	for ( my $qId = 0 ; $qId < @$queues ; $qId++ ) {
 		$pm->start and next;
-		if ( $qId == 1 ) {
-			$progress = Term::ProgressBar->new( { count => scalar @$q } );
-		}
+		my $q = $queues->[$qId];
+
+		# progress bar is created only for first process (the progress of other processes will be similar)
+		my $progressBar = Term::ProgressBar->new( { count => scalar @$q } ) if ( $qId == 0 );
+
 		my $i = 0;
 		foreach my $lum (@$q) {
-			modifyLuminance($lum);
-			if ( $qId == 1 ) {
-				$progress->update( ++$i );
-			}
+			modifyOneFile($lum);
+			$progressBar->update( ++$i ) if ( $qId == 0 );
 		}
 		$pm->finish( 0, $q );
 	}
@@ -313,33 +312,29 @@ sub luminance_change {
 
 }
 
-sub modifyLuminance {
+# updates luminance of a single file and saves the result in "Deflickered" sub-direcotry
+sub modifyOneFile {
 	my ($lum) = @_;
 
 	debug( "Original luminance of " . $lum->{filename} . ": " . $lum->{original} . "\n" );
 	debug( " Changed luminance of " . $lum->{filename} . ": " . $lum->{value} . "\n" );
 
 	my $brightness = ( 1 / ( $lum->{original} / $lum->{value} ) ) * 100;
-
-	#my $gamma = 1 / ( $lum->{original} / $lum->{value} );
-
 	debug( "Imagemagick will set brightness of " . $lum->{filename} . " to: $brightness\n" );
 
+	#my $gamma = 1 / ( $lum->{original} / $lum->{value} );
 	#debug("Imagemagick will set gamma value of ".$lum->{filename}." to: $gamma\n");
 
-	debug("Changing brightness of $lum->{filename} and saving to the destination directory...\n");
 	my $image = Image::Magick->new;
 	$image->Read( $lum->{filename} );
-
 	$image->Mogrify( 'modulate', brightness => $brightness );
 
 	#$image->Gamma( gamma => $gamma, channel => 'All' );
 	$image->Write( "Deflickered/" . $lum->{filename} );
 }
 
+# prints the correct use of this script
 sub usage {
-
-	# prints the correct use of this script
 	say "Usage:";
 	say "-w    Choose the rolling average window for luminance smoothing (Default 15)";
 	say "-p    Number of luminance smoothing passes (Default 1)";
