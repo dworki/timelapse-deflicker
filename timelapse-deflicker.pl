@@ -28,6 +28,7 @@ use Term::ProgressBar;
 use Image::ExifTool qw(:Public);
 use Time::HiRes qw(gettimeofday tv_interval);
 use Parallel::ForkManager;
+use File::Path;
 
 #use File::Spec;
 
@@ -39,7 +40,8 @@ my $DEBUG         = 0;
 my $rollingWindow = 15;
 my $passes        = 1;
 my $processes     = 2;
-
+my $input         = '.';
+my $output        = 'Deflickered';
 #####################
 # handle flags and arguments
 # h is "help" (no arguments)
@@ -48,7 +50,9 @@ my $processes     = 2;
 # w is "rolling window size" (single numeric argument)
 # p is "passes" (single numeric argument)
 # t is "threads" (single numeric argument)
-my $opt_string = 'hvdw:p:t:';
+# i is "input" (path to input dir with images or file with list of images to process ... default:'.')
+# o is "output" (output directory where to put processed files ... default: './Deflickered')
+my $opt_string = 'hvdw:p:t:i:o:';
 getopts( "$opt_string", \my %opt ) or usage() and exit 1;
 
 # print help message if -h is invoked
@@ -62,6 +66,10 @@ $DEBUG         = 1         if $opt{'d'};
 $rollingWindow = $opt{'w'} if defined( $opt{'w'} );
 $passes        = $opt{'p'} if defined( $opt{'p'} );
 $processes     = $opt{'t'} if defined( $opt{'t'} );
+$input         = $opt{'i'} if defined( $opt{'i'} );
+$input =~ s|/$||; # remove trailing slash
+$output	= $opt{'o'} if defined( $opt{'o'} );
+$output =~ s|/$||; # remove trailing slash
 
 #This integer test fails on "+n", but that isn't serious here.
 die "The rolling average window for luminance smoothing should be a positive number greater or equal to 2"
@@ -69,8 +77,8 @@ die "The rolling average window for luminance smoothing should be a positive num
 die "The number of passes should be a positive number greater or equal to 1"  if !( $passes eq int($passes)       && $passes > 0 );
 die "The number of threads should be a positive number greater or equal to 1" if !( $processes eq int($processes) && $processes > 0 );
 
-# load all image files from current directory
-my @files = findFilesToProcess(".");
+# load image files
+my @files = findFilesToProcess($input);
 my $count = scalar @files;
 
 if ( $count < 2 ) { die "Cannot process less than two files.\n" }
@@ -99,13 +107,33 @@ exit 0;
 
 # create sorted list of all image files in given directory
 sub findFilesToProcess() {
-	my ($dir) = @_;
-	opendir( DATA_DIR, $dir ) || die "Cannot open $dir\n";
+	my ($input) = @_;
+	my $type;
+	# load a raw list of files from direcotry or from list file
+	my @files;
+	if ( -d $input ) {
+		opendir( DIR, $input ) or die "Cannot open dir $input\n";
+		while ( my $file = readdir(DIR) ) {
+			push( @files, $file );
+		}
+		closedir(DIR);
+		@files = sort(@files);
+	} else {
+		open(IN, "< $input") or die "Cannot open list file $input\n";
+		while (<IN>) {
+			s/[\r\n]//g;
+			next if m/^[ \t]*$/;
+			next if m/^#/;
+			push @files, $_;
+		}
+		close(IN);
+	}
 
 	# create a clean list of image files
 	my $ft      = File::Type->new();
 	my $prevfmt = "";
-	while ( my $file = readdir(DATA_DIR) ) {
+	my @out;
+	for my $file (@files){
 		my $type = $ft->mime_type($file);
 		my ( $filetype, $fileformat ) = split( /\//, $type );
 		next unless ( $filetype eq "image" );
@@ -116,12 +144,11 @@ sub findFilesToProcess() {
 			# no more warnings about this from now on
 			$prevfmt = "warned";
 		}
-		push @files, $file;
+		push @out, $file;
 	}
-	closedir(DATA_DIR);
 
 	# assume that the files are named in dictionary sequence - they will be processed as such.
-	return sort @files;
+	return @out;
 }
 
 sub initializeImageExifTool {
@@ -280,8 +307,8 @@ sub modifyLuminance {
 	my ($luminance) = @_;
 
 	# ensure output directory exists
-	if ( !-d "Deflickered" ) {
-		mkdir("Deflickered") || die "Error creating directory: $!\n";
+	if ( !-d $output ) {
+		mkpath($output) || die "Error creating directory: $!\n";
 	}
 
 	# split work into multiple queues for parallel processing
@@ -330,22 +357,38 @@ sub modifyOneFile {
 	$image->Mogrify( 'modulate', brightness => $brightness );
 
 	#$image->Gamma( gamma => $gamma, channel => 'All' );
-	$image->Write( "Deflickered/" . $lum->{filename} );
+	my $f = $lum->{filename};
+	$f =~ s|.*/||; # take just filename without path (in case input file contained files in different directories)
+	$image->Write( $output ."/". $f );
 }
 
 # prints the correct use of this script
 sub usage {
-	say "Usage:";
-	say "-w    Choose the rolling average window for luminance smoothing (Default 15)";
-	say "-p    Number of luminance smoothing passes (Default 1)";
-	say "       Sometimes 2 passes might give better results.";
-	say "       Usually you would not want a number higher than 2.";
-	say "-t    Number of threads (processes) to use for calculation and conversion";
-	say "       Use number of available CPU cores. Speed gain depends heavily";
-	say "       on HDD perfomance (Default 2)";
-	say "-h    Usage";
-	say "-v    Verbose";
-	say "-d    Debug";
+	say <<EOT;
+	
+Usage:
+ -w <N>     Rolling average window for luminance smoothing (Default 15)
+ -p <N>     Number of luminance smoothing passes (Default 1)
+              Sometimes 2 passes might give better results.
+              Usually you would not want a number higher than 2.
+ -t <N>     Number of threads to use for calculation and conversion (Default 2)
+              Use the number of available CPU cores. Speed gain depends heavily
+              on HDD perfomance.
+ -i <PATH>  Input directory or list file (Default '.').
+              Reads files from given directory in alphabetical order.
+              If a file is given, the file should contain a list of image files 
+              to be processed (possibly from multiple input directories).
+              Each file must be on separate line and can be given with relative
+              or absolute path. Lines starting with '#' are ignored. 
+ -o <PATH>  Output directory for processed images (Default './Deflicker')
+              In case the input file contained files from multiple different 
+              directories they all end up in the same output dir (possibly 
+              overwriting each other ... be careful with naming).
+ -h         Print this usage
+ -v         Verbose
+ -d         Debug
+
+EOT
 }
 
 sub verbose {
